@@ -1,0 +1,1444 @@
+#!/usr/bin/env python3
+"""
+phase1_mission_node — spin, look, land, repeat.
+
+The Phase 1 flight for the 5x5 m arena. The drone starts on a base in a corner,
+and the sites it must land on are somewhere in the square with it. There is
+nowhere to fly TO before looking, so this mission does not fly a pattern at all:
+it takes off, turns on the spot, and only ever translates once it has something
+to translate towards.
+
+    arm  ->  register the base under us as the takeoff base
+         ->  take off to takeoff_alt
+         ->  is a confirmed, unvisited, non-takeoff base in the map?
+                 yes -> fly over it -> confirm on the belly camera
+                          confirmed -> LAND, mark visited, take off, repeat
+                          not confirmed -> blacklist it, resume searching
+                 no  -> turn 45 deg CW, settle, look again
+                          8 turns with nothing -> the fallback
+         ->  once `target_bases` landings are done: fly to the takeoff base,
+             land on it, DONE.
+
+State machine
+-------------
+    WAIT_FCU -> ARMING -> REGISTER -> TAKEOFF -> SELECT -+-> TRAVEL -> CONFIRM
+                  ^                                      |              |
+                  |                                      +-> ROTATE     |
+                  |                                      |    ^   |     |
+                  |                                      |    +-SETTLE  |
+                  |                                      |              v
+                  +---------------- DWELL <---------------------------- LAND
+                                      |
+                                      +-> DONE
+
+Why turning instead of flying a pattern
+---------------------------------------
+Every metre flown is visual-odometry drift, and the arena gives the VO very
+little to work with (docs/Landing Sites.md, and the ORB survey that found 46
+keypoints in a whole frame). A 5x5 m square is small enough that a camera at
+1 m sees all of it from one spot given enough headings, so the cheapest search
+is the one that does not move the vehicle: turn, look, turn. The only
+translation in the whole mission is the leg to a base the drone has already
+decided to land on.
+
+Why the pause matters
+---------------------
+Detection runs continuously — the detectors know nothing about this node — but
+the mission only ACTS on detections that were taken while the vehicle was
+stationary. A pad seen mid-turn is projected through a yaw estimate that is
+still slewing, and lands in the map metres from the real thing. Yaw has to be
+settled and held for `settle_s` before the map is read. That is also why the
+pause is short: it is long enough for the estimate to stop moving, not long
+enough to accumulate meaningful drift standing still.
+
+Why the takeoff base is declared, not detected
+----------------------------------------------
+The base the drone starts on is a rectangle with a circular hole rather than the
+disc-with-ring of a real landing site, but it carries the same colours and the
+same cross, and from an oblique angle the detector does sometimes call it. Left
+alone it would become a map candidate, and ruling it out would cost a travel leg
+and a confirmation hover — drift spent on a question already answered. So the
+instant the vehicle arms, its own position is registered as the takeoff base
+(`RegisterTakeoffBase`), and pad_map_node refuses to map anything at all before
+that arm. See docs/Phase 1 Mission.md.
+
+Speed
+-----
+There is no setpoint stepping here. One setpoint per leg, and the speed is the
+FCU's business: WPNAV_SPEED / WPNAV_ACCEL bound the translation and ATC_SLEW_YAW
+bounds the turn, all set in config/params/holybro_sitl.parm. Chopping a 2 m leg
+into pieces would not make the vehicle gentler — the position controller already
+accelerates against its own limits — it would only add arrival tests, each with
+its own tolerance, on an estimate that is the least trustworthy thing in the
+stack. Takeoff speed is deliberately NOT touched; the existing climb is fine.
+
+Interfaces
+----------
+in:   /hydrone/pads/map           hydrone_msgs/PadMap        (what to fly to)
+      /hydrone/pads/down/…        hydrone_msgs/PadDetection  (down cam confirms)
+      /mavros/state, /mavros/local_position/pose
+out:  /mavros/setpoint_position/local
+      /hydrone/mission/status     std_msgs/String
+srv:  /mavros/set_mode, /mavros/cmd/arming, /mavros/cmd/takeoff
+      /hydrone/pads/mark_visited, /hydrone/pads/register_takeoff_base
+
+Dry run — `dry_run:=true`, and phase1_dry.launch.py
+---------------------------------------------------
+The same state machine, the same map, the same belly camera, and NOTHING SENT
+TO THE FLIGHT CONTROLLER. A human carries the drone and is the actuator: the
+node prints `>>> RAISE …`, `>>> TURN … 45 deg`, `>>> CARRY … 2.4 m`, `>>> PUT
+IT DOWN`, and every transition still waits on the MEASURED pose, so the
+rehearsal advances only when the drone has physically been moved. It exists
+because the mission is worth debugging in the arena, against the real pads and
+the real estimate, without motors — a spinning propeller in someone's hands is
+the one failure this whole file must never produce.
+
+What makes that structural rather than a promise: the arm, mode and takeoff
+CLIENTS and the setpoint PUBLISHER are never created (see the I/O section), so
+no path through this node reaches the FCU — including one added later by
+someone who did not read this. `_start_call`, `_set_mode` and `_stream` all
+refuse on None, so a forgotten guard is a log line rather than a command.
+
+This is a guarantee about THIS STACK, not about the vehicle. MAVROS runs
+normally, /mavros/cmd/arming still exists for anyone who types one, and the
+transmitter never went through MAVROS at all. Arming is settled at the flight
+controller: set an arming check the vehicle cannot pass before a rehearsal, and
+take the props off. `_dry_audit` checks the one thing it usefully can — that
+nothing ELSE in the graph is publishing setpoints, which is what a forgotten
+phase1_real in another terminal looks like.
+
+What still happens, because it is the point: the pretend-arm registers the
+takeoff base, that opens pad_map_node's gate, and the map, its markers and the
+feature map build from there exactly as they would in flight.
+"""
+
+import math
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+
+from mavros_msgs.msg import State, StatusText
+from mavros_msgs.srv import CommandBool, CommandTOL, SetMode
+
+from hydrone_msgs.msg import PadDetection, PadMap
+from hydrone_msgs.srv import MarkPadVisited, RegisterTakeoffBase
+
+
+# ── Async service helper ─────────────────────────────────────────────────────
+
+class _Call:
+    """One in-flight service call with its own deadline.
+
+    rclpy's spin_until_future_complete cannot be used here: this node's tick
+    runs inside the executor, and blocking it would stop the setpoint stream.
+    """
+
+    PENDING, OK, FAILED, TIMEOUT = "pending", "ok", "failed", "timeout"
+
+    def __init__(self, node: Node, client, request, timeout_s: float):
+        self.name = client.srv_name
+        self.future = client.call_async(request)
+        self.deadline_ns = (node.get_clock().now().nanoseconds
+                            + int(timeout_s * 1e9))
+
+    def poll(self, now_ns: int) -> str:
+        if self.future.done():
+            result = self.future.result()
+            if result is None:
+                return self.FAILED
+            # MAVROS replies use either `success` (CommandBool/CommandTOL) or
+            # `mode_sent` (SetMode).
+            ok = getattr(result, "success", None)
+            if ok is None:
+                ok = getattr(result, "mode_sent", False)
+            return self.OK if ok else self.FAILED
+        if now_ns > self.deadline_ns:
+            self.future.cancel()
+            return self.TIMEOUT
+        return self.PENDING
+
+
+def wrap_pi(angle: float) -> float:
+    """Fold an angle into (-pi, pi]."""
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_of(pose: PoseStamped) -> float:
+    """Yaw of a pose, ENU, CCW-positive from east."""
+    q = pose.pose.orientation
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+class Phase1MissionNode(Node):
+
+    # ── States ──────────────────────────────────────────────────────────────
+    WAIT_FCU = "WAIT_FCU"
+    ARMING = "ARMING"
+    REGISTER = "REGISTER"
+    TAKEOFF = "TAKEOFF"
+    SELECT = "SELECT"
+    SETTLE = "SETTLE"
+    ROTATE = "ROTATE"
+    TRAVEL = "TRAVEL"
+    CONFIRM = "CONFIRM"
+    LAND = "LAND"
+    DWELL = "DWELL"
+    DONE = "DONE"
+    ABORTED = "ABORTED"
+
+    # ── Why we are landing. Decides what happens after the dwell. ───────────
+    #   PAD      a confirmed landing site: count it, then go find the next one
+    #   FALLBACK the search came up empty: touch down, take off, land, stop
+    #   FINAL    the last landing of the run: stay down
+    LAND_PAD = "pad"
+    LAND_FALLBACK = "fallback"
+    LAND_FINAL = "final"
+
+    def __init__(self, **kwargs):
+        # **kwargs reaches rclpy's Node so tests can pass parameter_overrides;
+        # the parameters here are read once, in __init__.
+        super().__init__("phase1_mission", **kwargs)
+
+        # ── Parameters ──────────────────────────────────────────────────────
+        # Metres above the takeoff plane — which is the TOP of the base the
+        # drone starts on, not the arena floor. 1 m keeps a test flight cheap to
+        # crash; at that height the 320x240 / 90 deg belly camera covers a ~2 m
+        # square of floor, so a 1 m base is in frame whenever the position error
+        # is under about half a metre.
+        self.declare_parameter("takeoff_alt", 1.0)
+        # How many landing sites to visit before going home. The takeoff base is
+        # NOT one of them.
+        #
+        # ONE, not the competition's two, while this mission has never been
+        # flown: the first question is whether a single
+        # find-confirm-land-take-off-return cycle closes at all, and a second
+        # base only adds a leg on an estimate that has already been through a
+        # landing and a takeoff. Raise it once one cycle has been watched end to
+        # end. Kept in step with phase1.launch.py's default so `ros2 run` and
+        # `ros2 launch` do not quietly disagree.
+        self.declare_parameter("target_bases", 1)
+
+        # ── The search ──────────────────────────────────────────────────────
+        self.declare_parameter("rotation_step_deg", 45.0)
+        # 8 x 45 deg = one full turn. Past that the drone is looking at scenery
+        # it has already rejected.
+        self.declare_parameter("max_rotations", 8)
+        # Held stationary before the map is believed. Short on purpose: long
+        # enough for the yaw estimate to stop moving, short enough not to spend
+        # the flight hovering. Your ceiling was 2 s.
+        self.declare_parameter("settle_s", 2.0)
+        self.declare_parameter("yaw_tol_deg", 8.0)
+        self.declare_parameter("rotate_timeout_s", 20.0)
+
+        # ── Flying to a candidate ───────────────────────────────────────────
+        self.declare_parameter("arrive_tol_m", 0.35)
+
+        # ── Confirming it on the belly camera ───────────────────────────────
+        # The forward camera IDENTIFIES (it sees across the arena, at ranges
+        # where the ring and cross are not resolvable and confidence is capped);
+        # the down camera VALIDATES from directly above, where they are. A
+        # candidate has to earn `confirm_detections` fresh looks above
+        # `confirm_confidence` or it is not a landing site.
+        # The belly camera's detection topic. Its own, separate from the
+        # /hydrone/pads/detections bus pad_map_node fuses: the down camera does
+        # not project (competition bases are raised, and a flat-floor cast from
+        # overhead lands past the pad), so its detections have no position and
+        # have no business in the map.
+        self.declare_parameter("detections_topic",
+                               "/hydrone/pads/down/detections")
+        self.declare_parameter("confirm_detections", 3)
+        self.declare_parameter("confirm_confidence", 0.60)
+        self.declare_parameter("confirm_timeout_s", 25.0)
+        self.declare_parameter("fresh_detection_s", 1.0)
+
+        # ── Landing, and the plumbing ───────────────────────────────────────
+        self.declare_parameter("dwell_s", 4.0)
+        self.declare_parameter("land_timeout_s", 60.0)
+        self.declare_parameter("land_settle_s", 2.0)
+        # Touchdown = the reported altitude STOPS CHANGING. How much movement
+        # still counts as stopped, m, measured peak-to-peak over land_settle_s.
+        # A descending vehicle covers far more than this in that window (even a
+        # slow 0.05 m/s descent moves 0.10 m in 2 s), a resting one covers only
+        # estimator noise. Raise it if a landing is never declared; lower it if
+        # one is declared while still visibly descending.
+        self.declare_parameter("land_still_tol_m", 0.05)
+        # Stillness ALONE is not touchdown: a hover is perfectly still too, and
+        # between the LAND mode command and ArduPilot actually starting the
+        # descent there is a gap long enough to fill the window. On 2026-08-23
+        # that gap declared LANDED 2.1 s after CONFIRM, at z=1.50 m — the full
+        # hover altitude, having descended nothing — and then wrote that 1.50 m
+        # into the pad's height as if the drone were resting on it.
+        #
+        # So the vehicle must also have GONE DOWN. The confirmation hover sits
+        # takeoff_alt above the pad, so a real landing covers far more than
+        # this; a hover covers none of it.
+        self.declare_parameter("min_descent_m", 0.30)
+        self.declare_parameter("takeoff_timeout_s", 45.0)
+        self.declare_parameter("service_timeout_s", 30.0)
+        self.declare_parameter("setpoint_hz", 10.0)
+        self.declare_parameter("auto_start", True)
+
+        # ── DRY RUN: the vehicle never arms, a human is the actuator ────────
+        # The whole state machine runs, against the REAL map, the REAL pose and
+        # the REAL belly camera — but nothing is ever sent to the FCU. Every
+        # command becomes an instruction to the person holding the drone, and
+        # every transition still waits on the measured pose, so the rehearsal
+        # only advances when that person actually raises, turns, carries or sets
+        # the drone down.
+        #
+        # This is NOT a soft switch. In dry run the arm, mode and takeoff
+        # service clients and the setpoint publisher are never CREATED, so
+        # there is no object for a bug in the state machine to send through.
+        # It stops THIS STACK commanding the vehicle; it does not stop the
+        # vehicle arming — that belongs to the flight controller, as an arming
+        # check it cannot pass.
+        self.declare_parameter("dry_run", False)
+        # How long to sit on the takeoff base before the rehearsal treats the
+        # vehicle as armed. It is the moment the takeoff base is registered and
+        # the map starts accepting detections, exactly as a real arm is, so it
+        # wants to be long enough for the person to have the drone still and
+        # square on the base.
+        self.declare_parameter("dry_arm_delay_s", 3.0)
+        # Gap between repeats of a mode/arm/takeoff command. MAVROS acking a
+        # command is not the same as ArduPilot accepting it, so every command is
+        # re-sent on this period until /mavros/state shows the effect.
+        self.declare_parameter("retry_period_s", 2.0)
+
+        p = lambda n: self.get_parameter(n).value
+        self.takeoff_alt = float(p("takeoff_alt"))
+        self.target_bases = int(p("target_bases"))
+        self.rotation_step = math.radians(float(p("rotation_step_deg")))
+        self.max_rotations = int(p("max_rotations"))
+        self.settle_s = float(p("settle_s"))
+        self.yaw_tol = math.radians(float(p("yaw_tol_deg")))
+        self.rotate_timeout = float(p("rotate_timeout_s"))
+        self.arrive_tol = float(p("arrive_tol_m"))
+        self.confirm_detections = int(p("confirm_detections"))
+        self.confirm_conf = float(p("confirm_confidence"))
+        self.confirm_timeout = float(p("confirm_timeout_s"))
+        self.fresh_s = float(p("fresh_detection_s"))
+        self.dwell_s = float(p("dwell_s"))
+        self.land_timeout = float(p("land_timeout_s"))
+        self.land_settle = float(p("land_settle_s"))
+        self.land_still_tol = float(p("land_still_tol_m"))
+        self.min_descent = float(p("min_descent_m"))
+        self.takeoff_timeout = float(p("takeoff_timeout_s"))
+        self.svc_timeout = float(p("service_timeout_s"))
+        self.auto_start = bool(p("auto_start"))
+        self.retry_period = float(p("retry_period_s"))
+        self.dry_run = bool(p("dry_run"))
+        self.dry_arm_delay = float(p("dry_arm_delay_s"))
+
+        # ── State ───────────────────────────────────────────────────────────
+        self.state = self.WAIT_FCU
+        self._state_since = self._now()
+        self.mav_state = State()
+        self.pose: PoseStamped | None = None
+        self.pad_map: PadMap | None = None
+
+        # Where we armed. The fallback for the return leg if the map somehow has
+        # no takeoff-base entry.
+        self.home: tuple[float, float] | None = None
+        self.base_registered = False
+        self.landed_count = 0
+        # Candidates the belly camera refused. Mission-local on purpose: the map
+        # is a record of what was SEEN, and a pad that failed confirmation was
+        # genuinely seen. Deciding it is not worth a second visit is this
+        # mission's judgement, so this mission keeps it.
+        self.blacklist: set[int] = set()
+        self.target_id: int | None = None
+        self.rotations_done = 0
+        self.landing_for = self.LAND_PAD
+        # Set only by the fallback: the next takeoff exists to be followed by a
+        # landing, not by a search.
+        self._land_after_takeoff = False
+
+        # [x, y, z, yaw] — yaw is commanded, not just carried: this mission
+        # turns on the spot, and a setpoint with a fixed orientation would fight
+        # the very thing the search is made of.
+        self.setpoint: list[float] = [0.0, 0.0, 0.0, 0.0]
+        self.stream_setpoint = False
+        self._call: _Call | None = None
+        self._pending: str | None = None    # what _call is for
+        self._last_cmd_t = 0.0              # when the last command went out
+        self._takeoff_tries = 0
+        # Down-camera looks accepted during the current CONFIRM.
+        self._confirm_hits = 0
+        self._z_hist: list[tuple[float, float]] = []
+        self._land_entry_z: float | None = None
+        self._takeoff_start_z = 0.0
+        self._last_down: PadDetection | None = None
+        self._last_down_t = 0.0
+        # Last refusal ArduPilot gave us, and when. See _cb_statustext.
+        self._fcu_gripe = ""
+        self._fcu_gripe_t = 0.0
+
+        # ── I/O ─────────────────────────────────────────────────────────────
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        # THE SETPOINT PUBLISHER IS NOT CREATED IN DRY RUN, and neither are the
+        # three FCU clients below. A flag consulted at each call site is one
+        # missed `if` away from commanding a vehicle somebody is holding; an
+        # object that does not exist cannot be sent through by any path,
+        # including one added later by someone who never read this comment.
+        # _stream, _set_mode and _start_call all refuse on None, so the failure
+        # mode of forgetting a guard is a log line, not a spinning motor.
+        self.pub_sp = None if self.dry_run else self.create_publisher(
+            PoseStamped, "/mavros/setpoint_position/local", 10)
+        self.pub_status = self.create_publisher(
+            String, "/hydrone/mission/status", 10)
+
+        self.create_subscription(State, "/mavros/state", self._cb_state, 10)
+        self.create_subscription(PoseStamped, "/mavros/local_position/pose",
+                                 self._cb_pose, sensor_qos)
+        self.create_subscription(PadMap, "/hydrone/pads/map", self._cb_map, 10)
+        # The belly camera's OWN topic, not the shared /hydrone/pads/detections
+        # the map is built from. Those detections carry no position — see
+        # _cb_detection — so they must not reach pad_map_node, and keeping them
+        # off its bus is what guarantees it.
+        self.create_subscription(PadDetection,
+                                 self.get_parameter("detections_topic").value,
+                                 self._cb_detection, 20)
+        # ArduPilot explains its refusals in STATUSTEXT ("Arm: Throttle too
+        # high", "PreArm: VisOdom: not healthy", ...). MAVROS publishes
+        # statustext/recv BEST_EFFORT; a RELIABLE subscription is
+        # QoS-incompatible and receives nothing at all.
+        self.create_subscription(StatusText, "/mavros/statustext/recv",
+                                 self._cb_statustext, sensor_qos)
+
+        if self.dry_run:
+            self.cli_mode = None
+            self.cli_arm = None
+            self.cli_takeoff = None
+        else:
+            self.cli_mode = self.create_client(SetMode, "/mavros/set_mode")
+            self.cli_arm = self.create_client(CommandBool,
+                                              "/mavros/cmd/arming")
+            self.cli_takeoff = self.create_client(CommandTOL,
+                                                  "/mavros/cmd/takeoff")
+        # The map's own services are NOT part of the lockdown: they move no
+        # vehicle. Registering the takeoff base and marking a pad visited are
+        # exactly the bookkeeping a rehearsal is there to exercise.
+        self.cli_visited = self.create_client(MarkPadVisited,
+                                              "/hydrone/pads/mark_visited")
+        self.cli_base = self.create_client(
+            RegisterTakeoffBase, "/hydrone/pads/register_takeoff_base")
+
+        self.create_service(Trigger, "/hydrone/mission/start", self._svc_start)
+        self.create_service(Trigger, "/hydrone/mission/abort", self._svc_abort)
+
+        self.create_timer(1.0 / max(float(p("setpoint_hz")), 1.0),
+                          self._stream)
+        self.create_timer(0.1, self._tick)
+        self.create_timer(1.0, self._publish_status)
+
+        if self.dry_run:
+            # The human needs a REPEATING cue, not a one-shot line that has
+            # scrolled away by the time they have both hands on the drone.
+            self.create_timer(1.0, self._pilot_cue)
+            # And one late check that nothing ELSE is driving the vehicle.
+            # See _dry_audit.
+            self._audit_timer = self.create_timer(10.0, self._dry_audit)
+            self.get_logger().warn(
+                "════════════════════════════════════════════════════════\n"
+                "  DRY RUN — NOTHING IS SENT TO THE FLIGHT CONTROLLER.\n"
+                "  No arm, mode or takeoff client exists in this node and no\n"
+                "  setpoint is published. A human is the actuator: raise,\n"
+                "  turn, carry and set the drone down when told to, and the\n"
+                "  mission advances on the MEASURED pose exactly as it would\n"
+                "  in flight. Instructions are the >>> lines below.\n"
+                "\n"
+                "  This stops the STACK commanding the vehicle. It does not\n"
+                "  stop the vehicle ARMING — set an arming check it cannot\n"
+                "  pass, and take the props off.\n"
+                "════════════════════════════════════════════════════════")
+
+        self.get_logger().info(
+            f"phase1_mission ready — takeoff to {self.takeoff_alt:.1f} m, "
+            f"search by {math.degrees(self.rotation_step):.0f} deg turns "
+            f"(max {self.max_rotations}), land on {self.target_bases} base(s), "
+            "then home. "
+            f"{'Auto-starting.' if self.auto_start else 'Call /hydrone/mission/start.'}")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Inputs
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _cb_state(self, msg: State):
+        self.mav_state = msg
+
+    def _cb_pose(self, msg: PoseStamped):
+        self.pose = msg
+
+    def _cb_map(self, msg: PadMap):
+        self.pad_map = msg
+
+    def _cb_detection(self, msg: PadDetection):
+        """Keep the freshest belly-camera look.
+
+        CONFIDENCE ONLY. `msg.position` is not read here and is not populated
+        by the down detector at all: this camera answers "is there a base under
+        me", and the answer to "where is it" comes from the ZED, through the
+        map, which is the estimate the drone was flown here on.
+
+        Only the down camera is kept HERE, and only for confirmation. The
+        forward camera is not ignored by the mission — it is the thing that
+        finds bases in the first place — but it works through the map, which is
+        where its many partial sightings get fused into one position. A raw
+        forward frame is a lead, not a landing decision.
+        """
+        if msg.camera == "down":
+            self._last_down = msg
+            self._last_down_t = self._now()
+
+    def _cb_statustext(self, msg: StatusText):
+        """Remember ArduPilot's most recent arm/pre-arm complaint."""
+        text = msg.text.strip()
+        if text.startswith(("Arm:", "PreArm:")):
+            if text != self._fcu_gripe:
+                self.get_logger().warn(f"FCU refuses: {text}")
+            self._fcu_gripe = text
+            self._fcu_gripe_t = self._now()
+
+    def _fcu_reason(self) -> str:
+        """The FCU's refusal, if it is recent enough to be about this attempt."""
+        if self._fcu_gripe and self._now() - self._fcu_gripe_t < 10.0:
+            return self._fcu_gripe
+        return "no reason given by the FCU"
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Services
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _svc_start(self, request, response):
+        self.auto_start = True
+        if self.state in (self.DONE, self.ABORTED):
+            self._reset()
+        response.success = True
+        response.message = "mission armed to start"
+        return response
+
+    def _svc_abort(self, request, response):
+        self.get_logger().warn("ABORT requested — landing where we are.")
+        self.stream_setpoint = False
+        self._enter(self.ABORTED)
+        self._set_mode("LAND")
+        response.success = True
+        response.message = "aborting: landing in place"
+        return response
+
+    def _reset(self):
+        self.state = self.WAIT_FCU
+        self.home = None
+        self.base_registered = False
+        self.landed_count = 0
+        self.blacklist.clear()
+        self.target_id = None
+        self.rotations_done = 0
+        self.landing_for = self.LAND_PAD
+        self._land_after_takeoff = False
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Setpoint stream
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _stream(self):
+        """Publish the current position + yaw target.
+
+        Deliberately silent whenever the FCU owns the descent (LAND, DWELL): a
+        position setpoint arriving mid-landing is at best ignored and at worst
+        fights the flare.
+        """
+        # Dry run: there IS no publisher. The state machine still sets
+        # `stream_setpoint` and still keeps `self.setpoint` up to date — that is
+        # what _pilot_cue reads to tell the human where to put the drone — it
+        # just has nowhere to send it.
+        if self.pub_sp is None or not self.stream_setpoint:
+            return
+        x, y, z, yaw = self.setpoint
+        sp = PoseStamped()
+        sp.header.stamp = self.get_clock().now().to_msg()
+        sp.header.frame_id = "map"
+        sp.pose.position.x = float(x)
+        sp.pose.position.y = float(y)
+        sp.pose.position.z = float(z)
+        sp.pose.orientation.z = math.sin(yaw / 2.0)
+        sp.pose.orientation.w = math.cos(yaw / 2.0)
+        self.pub_sp.publish(sp)
+
+    def _goto(self, x: float, y: float, z: float, yaw: float):
+        self.setpoint = [x, y, z, yaw]
+        self.stream_setpoint = True
+
+    def _hold(self, yaw: float | None = None):
+        """Hold the current setpoint, optionally re-aiming the yaw."""
+        if yaw is not None:
+            self.setpoint[3] = yaw
+        self.stream_setpoint = True
+
+    # ────────────────────────────────────────────────────────────────────────
+    # State machine
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _tick(self):
+        if self.state in (self.DONE, self.ABORTED):
+            return
+        handler = {
+            self.WAIT_FCU: self._do_wait_fcu,
+            self.ARMING: self._do_arming,
+            self.REGISTER: self._do_register,
+            self.TAKEOFF: self._do_takeoff,
+            self.SELECT: self._do_select,
+            self.SETTLE: self._do_settle,
+            self.ROTATE: self._do_rotate,
+            self.TRAVEL: self._do_travel,
+            self.CONFIRM: self._do_confirm,
+            self.LAND: self._do_land,
+            self.DWELL: self._do_dwell,
+        }[self.state]
+        handler()
+
+    # ── WAIT_FCU ─────────────────────────────────────────────────────────────
+
+    def _do_wait_fcu(self):
+        if not self.auto_start:
+            return
+        if not (self.mav_state.connected and self.pose is not None):
+            self._throttle("waiting for MAVROS link and a local position...")
+            return
+        # Not in dry run: those clients do not exist, so there is nothing to
+        # ask. Waiting on them would hold the rehearsal at WAIT_FCU forever.
+        if not self.dry_run and not (self.cli_arm.service_is_ready()
+                                     and self.cli_mode.service_is_ready()):
+            self._throttle("waiting for MAVROS command services...")
+            return
+
+        self.home = (self.pose.pose.position.x, self.pose.pose.position.y)
+        self.get_logger().info(
+            f"home = ({self.home[0]:.2f}, {self.home[1]:.2f}), heading "
+            f"{math.degrees(yaw_of(self.pose)):.0f} deg.")
+        self._enter(self.ARMING)
+
+    # ── ARMING ───────────────────────────────────────────────────────────────
+
+    def _do_arming(self):
+        """GUIDED first, then arm.
+
+        Retries are driven by elapsed time rather than by the previous call's
+        result: MAVROS acks a mode change that ArduPilot then declines (EKF not
+        ready, pre-arm check pending), so "the call succeeded" is not the same
+        as "the vehicle is in GUIDED". Only /mavros/state settles that.
+
+        GUIDED is checked BEFORE armed, which matters on the relaunch after a
+        landing: ArduCopter auto-disarms only after DISARM_DELAY (10 s by
+        default) and dwell is shorter than that, so the vehicle is usually still
+        armed — and still in LAND. Taking "armed" as done would send a takeoff
+        while in LAND, which ArduPilot refuses, forever.
+
+        DRY RUN: none of that happens. After `dry_arm_delay_s` on the base the
+        rehearsal simply declares the vehicle armed and moves on, because the
+        arm is not the interesting part — what the arm TRIGGERS is. Registering
+        the takeoff base and opening pad_map's gate both hang off this moment,
+        and both still happen, from REGISTER, exactly as they do in flight.
+        """
+        if self.dry_run:
+            if self._since_entered() < self.dry_arm_delay:
+                return
+            self.get_logger().warn(
+                "[dry] WOULD ARM (GUIDED, then arm) — nothing sent. Treating "
+                "the vehicle as armed from here; the takeoff base is about to "
+                "be registered and the map starts accepting detections.")
+            self._takeoff_tries = 0
+            self._enter(self.REGISTER if not self.base_registered
+                        else self.TAKEOFF)
+            return
+
+        if self.mav_state.mode == "GUIDED" and self.mav_state.armed:
+            self._takeoff_tries = 0
+            self._enter(self.REGISTER if not self.base_registered
+                        else self.TAKEOFF)
+            return
+        if self._poll_call() == "pending":
+            return
+        if self._now() - self._last_cmd_t < self.retry_period:
+            return
+
+        if self.mav_state.mode != "GUIDED":
+            self._set_mode("GUIDED")
+            return
+
+        self._start_call("arm", self.cli_arm, CommandBool.Request(value=True))
+
+        if self._since_entered() > self.takeoff_timeout:
+            self.get_logger().warn(
+                f"still not armed after {self.takeoff_timeout:.0f} s. "
+                f"ArduPilot says: {self._fcu_reason()}. Still retrying. "
+                "(Common causes: no EKF origin yet; no vision pose reaching the "
+                "FCU — check /mavros/vision_pose/pose; a GCS virtual joystick "
+                "holding the throttle stick off minimum.)")
+            self._state_since = self._now()
+
+    # ── REGISTER ─────────────────────────────────────────────────────────────
+
+    def _do_register(self):
+        """Declare the base under us, once, before we ever leave it.
+
+        This runs between arming and takeoff because that is the only moment the
+        drone's position IS the base's position, to the centimetre, with no
+        camera in the loop. pad_map_node maps nothing before this point, so the
+        takeoff base is guaranteed to be the first entry in the map rather than
+        something that has to be reconciled with an earlier sighting.
+
+        A failure here is not fatal. The mission still knows `home` and still
+        refuses to land on anything within `arrive_tol` of it, so the worst case
+        is a takeoff base that RViz draws as an ordinary pad.
+        """
+        if self.base_registered or self.pose is None:
+            if self.base_registered:
+                self._enter(self.TAKEOFF)
+            return
+
+        status = self._poll_call()
+        if status == "pending":
+            return
+        if status == "ok":
+            self.base_registered = True
+            self.get_logger().info("takeoff base registered.")
+            self._enter(self.TAKEOFF)
+            return
+
+        if not self.cli_base.service_is_ready():
+            if self._since_entered() > 5.0:
+                self.get_logger().warn(
+                    "/hydrone/pads/register_takeoff_base never came up — "
+                    "flying without a registered takeoff base. The map may "
+                    "offer the start base as a candidate; the mission will "
+                    "still refuse to land on anything at home.")
+                self.base_registered = True
+                self._enter(self.TAKEOFF)
+            return
+
+        if self._now() - self._last_cmd_t >= self.retry_period:
+            req = RegisterTakeoffBase.Request()
+            req.position.x = float(self.pose.pose.position.x)
+            req.position.y = float(self.pose.pose.position.y)
+            req.position.z = float(self.pose.pose.position.z)
+            self._start_call("register", self.cli_base, req)
+
+    # ── TAKEOFF ──────────────────────────────────────────────────────────────
+
+    def _do_takeoff(self):
+        """Ask the FCU to climb to takeoff_alt.
+
+        ArduCopter will not climb from a bare position setpoint in GUIDED — it
+        needs an explicit takeoff — so this is a command, not a setpoint, and the
+        setpoint stream only starts once we are up. The first setpoint holds the
+        position and heading we reached, so nothing moves at the handover.
+        """
+        # CLIMBED, not absolute altitude. takeoff_alt is a height above the
+        # surface we are leaving; pose.z is measured from the plane of the FIRST
+        # takeoff. On any pad at a different height the two disagree by exactly
+        # that difference, and comparing them directly is why the mission hung
+        # here on 2026-08-23: after landing on a pad 0.76 m below the start
+        # plane, a perfect 1.5 m climb reached z=0.74 while this test wanted
+        # 1.35, so the mission re-sent takeoff forever — and ArduPilot rejected
+        # every one of them, because the vehicle was already flying.
+        # FUDGE: +0.4 m added to the measured climb. Deliberate and known to
+        # be wrong -- it makes the threshold fire 0.4 m early so the real
+        # vehicle leaves TAKEOFF instead of looping through ARMING forever.
+        climbed = (self.pose.pose.position.z - self._takeoff_start_z + 0.4
+                   if self.pose is not None else 0.0)
+        if self.pose is not None and climbed >= self.takeoff_alt - 0.15:
+            x = self.pose.pose.position.x
+            y = self.pose.pose.position.y
+            yaw = yaw_of(self.pose)
+            self.get_logger().info(
+                f"airborne — climbed {climbed:.2f} m to z="
+                f"{self.pose.pose.position.z:.2f} m, "
+                f"heading {math.degrees(yaw):.0f} deg.")
+            self._goto(x, y, self.takeoff_alt, yaw)
+            self.rotations_done = 0
+            if self._land_after_takeoff:
+                # The fallback's second hop: up, then straight back down.
+                self._land_after_takeoff = False
+                self.get_logger().info(
+                    "fallback hop complete — landing to end the run.")
+                self._begin_landing()
+                return
+            self._enter(self.SELECT)
+            return
+
+        # DRY RUN: no command, and deliberately no timeout. The climb check
+        # above is the REAL one — it is satisfied when the person actually
+        # raises the drone — and ArduPilot is not here to refuse anything, so
+        # the "takeoff refused three times, aborting" path below would only
+        # ever fire on somebody being slow with their hands. _pilot_cue does
+        # the asking.
+        if self.dry_run:
+            return
+
+        if self._poll_call() == "pending":
+            return
+
+        if self._since_entered() > self.takeoff_timeout:
+            self._takeoff_tries += 1
+            if self._takeoff_tries > 3:
+                self.get_logger().error(
+                    "takeoff refused three times — check EKF origin/home "
+                    "(see docs/Develop Pipelines.md: no origin -> no home -> "
+                    "NAV_TAKEOFF fails). Aborting.")
+                self._enter(self.ABORTED)
+                return
+            self.get_logger().warn("takeoff did not lift us; retrying.")
+            self._enter(self.ARMING)
+            return
+
+        if self._now() - self._last_cmd_t >= self.retry_period:
+            req = CommandTOL.Request()
+            req.altitude = float(self.takeoff_alt)
+            self._start_call("takeoff", self.cli_takeoff, req)
+
+    # ── SELECT ───────────────────────────────────────────────────────────────
+
+    def _do_select(self):
+        """Decide what to do with the air we are holding.
+
+        Quota first, then a known lead, then the search. Checking the quota here
+        rather than after each landing means the "go home" decision is made in
+        exactly one place, and it is made while airborne with the map in hand.
+        """
+        if self.pose is None:
+            return
+
+        if self.landed_count >= self.target_bases:
+            hx, hy = self._takeoff_base_xy()
+            self.get_logger().info(
+                f"{self.landed_count} base(s) landed on — returning to the "
+                f"takeoff base at ({hx:.2f}, {hy:.2f}).")
+            self.target_id = None
+            self.landing_for = self.LAND_FINAL
+            self._goto(hx, hy, self.takeoff_alt, self.setpoint[3])
+            self._enter(self.TRAVEL)
+            return
+
+        pad = self._best_candidate()
+        if pad is not None:
+            self.target_id = int(pad.id)
+            self.landing_for = self.LAND_PAD
+            self.get_logger().info(
+                f"pad {pad.id} at ({pad.position.x:.2f}, {pad.position.y:.2f}) "
+                f"is confirmed in the map ({pad.observations} looks, conf "
+                f"{pad.confidence:.2f}) — flying over it.")
+            self._goto(pad.position.x, pad.position.y, self.takeoff_alt,
+                       self.setpoint[3])
+            self._enter(self.TRAVEL)
+            return
+
+        self._enter(self.SETTLE)
+
+    def _best_candidate(self):
+        """The nearest pad worth flying to, or None.
+
+        Worth flying to = confirmed by the map (three fused sightings, so not
+        one frame of noise), not already landed on, not the base we took off
+        from, and not one the belly camera has already refused. Nearest wins:
+        in a 5x5 m arena the differences are small, and the shortest leg is the
+        least drift.
+        """
+        if self.pad_map is None or self.pose is None:
+            return None
+        px = self.pose.pose.position.x
+        py = self.pose.pose.position.y
+        best, best_d = None, float("inf")
+        for pad in self.pad_map.pads:
+            if not self._is_candidate(pad):
+                continue
+            d = math.hypot(pad.position.x - px, pad.position.y - py)
+            if d < best_d:
+                best, best_d = pad, d
+        return best
+
+    def _is_candidate(self, pad) -> bool:
+        if pad.is_takeoff_base or pad.visited:
+            return False
+        if int(pad.id) in self.blacklist:
+            return False
+        if pad.observations < 3:
+            return False
+        # Belt and braces for the case where registration failed: never treat
+        # anything sitting where we armed as a landing site.
+        if self.home is not None:
+            if math.hypot(pad.position.x - self.home[0],
+                          pad.position.y - self.home[1]) < 1.0:
+                return False
+        return True
+
+    def _takeoff_base_xy(self) -> tuple[float, float]:
+        """Where home is. The map's registered entry if there is one, else the
+        position we armed at."""
+        if self.pad_map is not None:
+            for pad in self.pad_map.pads:
+                if pad.is_takeoff_base:
+                    return (pad.position.x, pad.position.y)
+        return self.home if self.home is not None else (0.0, 0.0)
+
+    # ── SETTLE ───────────────────────────────────────────────────────────────
+
+    def _do_settle(self):
+        """Hold still, let the estimate stop moving, then read the map.
+
+        The map is NOT read while this is counting down. That is the whole point
+        of the state: a detection taken while yaw was still slewing is projected
+        through a moving estimate, and the position it produces is wrong by
+        metres. Waiting costs two seconds and buys a map entry that means what
+        it says.
+        """
+        self._hold()
+        if self._since_entered() < self.settle_s:
+            return
+
+        pad = self._best_candidate()
+        if pad is not None:
+            self.rotations_done = 0
+            self._enter(self.SELECT)
+            return
+
+        if self.rotations_done >= self.max_rotations:
+            self.get_logger().warn(
+                f"{self.rotations_done} turns and no new base in sight — "
+                "falling back: landing, taking off once, landing again.")
+            self.landing_for = self.LAND_FALLBACK
+            self._begin_landing()
+            return
+
+        # Aim the next turn here rather than inside ROTATE, so ROTATE is a pure
+        # "are we there yet" and has no first-tick special case to get wrong.
+        self._hold(yaw=wrap_pi(self.setpoint[3] - self.rotation_step))
+        self.get_logger().info(
+            f"turn {self.rotations_done + 1}/{self.max_rotations}: "
+            f"heading for {math.degrees(self.setpoint[3]):.0f} deg.")
+        self._enter(self.ROTATE)
+
+    # ── ROTATE ───────────────────────────────────────────────────────────────
+
+    def _do_rotate(self):
+        """Turn one step clockwise, on the spot.
+
+        Clockwise is NEGATIVE yaw: the map frame is ENU and yaw runs
+        counter-clockwise from east, so a clockwise turn subtracts. The x/y/z of
+        the setpoint do not change — the FCU holds position while it yaws, and
+        the turn rate is ATC_SLEW_YAW's business, not this node's.
+        """
+        if self.pose is None:
+            return
+        self._hold()
+
+        error = abs(wrap_pi(yaw_of(self.pose) - self.setpoint[3]))
+        if error <= self.yaw_tol:
+            self.rotations_done += 1
+            self._enter(self.SETTLE)
+            return
+
+        if self._since_entered() > self.rotate_timeout:
+            self.get_logger().warn(
+                f"yaw still {math.degrees(error):.0f} deg off after "
+                f"{self.rotate_timeout:.0f} s — counting the turn anyway and "
+                "looking from here.")
+            self.rotations_done += 1
+            self._enter(self.SETTLE)
+
+    # ── TRAVEL ───────────────────────────────────────────────────────────────
+
+    def _do_travel(self):
+        """Fly to the setpoint SELECT placed. One leg, one setpoint.
+
+        Heading is untouched on the way: turning while translating would put the
+        detector's geometry and the position controller's demand in motion at
+        the same time, and there is nothing to gain — the belly camera looks
+        straight down and does not care which way the nose points.
+
+        There is no time budget. The leg ends when the vehicle arrives. A 60 s
+        one used to blacklist candidates that were still closing — pad 4 on
+        2026-08-23 was 0.70 m away when it fired — and every run is supervised,
+        so a slow leg is a human's call to abort, not this node's.
+        """
+        if self.pose is None:
+            return
+        self._hold()
+
+        d = math.hypot(self.pose.pose.position.x - self.setpoint[0],
+                       self.pose.pose.position.y - self.setpoint[1])
+        if d <= self.arrive_tol:
+            if self.landing_for == self.LAND_FINAL:
+                self.get_logger().info(
+                    "over the takeoff base — landing to finish the run.")
+                self._begin_landing()
+            else:
+                self.get_logger().info(
+                    f"over pad {self.target_id} — confirming on the belly "
+                    "camera.")
+                self._confirm_hits = 0
+                self._enter(self.CONFIRM)
+            return
+
+    # ── CONFIRM ──────────────────────────────────────────────────────────────
+
+    def _do_confirm(self):
+        """Prove the thing below us really is a landing site.
+
+        The forward camera found it across the arena, where the ring and the
+        cross are a handful of pixels and the detector's confidence is capped by
+        design (docs/Pad Detector.md). From directly above at 1 m the same
+        structure is hundreds of pixels across, so this is the look that decides.
+        `confirm_detections` separate frames must clear `confirm_confidence` —
+        one frame can be a glint on something blue.
+
+        A candidate that cannot manage that inside `confirm_timeout` is
+        blacklisted, and the search resumes from here. That is what makes a blue
+        tarp cost half a minute instead of the mission.
+        """
+        self._hold()
+
+        fresh = (self._last_down is not None
+                 and self._now() - self._last_down_t <= self.fresh_s)
+        if fresh and self._last_down.confidence >= self.confirm_conf:
+            self._confirm_hits += 1
+            # One detection must not be counted twice: the belly camera runs at
+            # 10 Hz and this tick at 10 Hz, so without clearing it a single
+            # frame would satisfy the whole quota on its own.
+            self._last_down = None
+            if self._confirm_hits >= self.confirm_detections:
+                self.get_logger().info(
+                    f"pad {self.target_id} CONFIRMED on the belly camera "
+                    f"({self._confirm_hits} looks) — landing.")
+                self._begin_landing()
+                return
+
+        if self._since_entered() > self.confirm_timeout:
+            self.get_logger().warn(
+                f"pad {self.target_id} did not confirm in "
+                f"{self.confirm_timeout:.0f} s ({self._confirm_hits}/"
+                f"{self.confirm_detections} looks) — not a landing site. "
+                "Blacklisting it and searching from here.")
+            self._reject_target()
+
+    def _reject_target(self):
+        """Give up on the current candidate and go back to turning."""
+        if self.target_id is not None:
+            self.blacklist.add(int(self.target_id))
+        self.target_id = None
+        # A fresh search, not a continuation: the drone is somewhere new, facing
+        # a direction it has not searched from, so the turns it already made
+        # tell us nothing about what is visible from here.
+        self.rotations_done = 0
+        if self.pose is not None:
+            self._goto(self.pose.pose.position.x, self.pose.pose.position.y,
+                       self.takeoff_alt, self.setpoint[3])
+        self._enter(self.SETTLE)
+
+    # ── LAND ─────────────────────────────────────────────────────────────────
+
+    def _begin_landing(self):
+        """Hand the descent to the FCU and stop talking to it.
+
+        The setpoint stream stops here. ArduPilot's LAND has a rangefinder flare
+        and it owns the vehicle from this point; a position setpoint arriving
+        mid-descent is at best ignored and at worst fights it.
+        """
+        self.stream_setpoint = False
+        self._z_hist = []
+        # The altitude the descent starts from, so touchdown can require that
+        # the vehicle actually left it.
+        self._land_entry_z = (self.pose.pose.position.z
+                              if self.pose is not None else None)
+        self._enter(self.LAND)
+        self._set_mode("LAND")
+
+    def _do_land(self):
+        """Wait for touchdown. Two independent signals, whichever comes first."""
+        # Keep asking until /mavros/state agrees we are in LAND. An acked mode
+        # command that ArduPilot then declined would otherwise leave us hovering
+        # here until the timeout.
+        if (not self.dry_run
+                and self.mav_state.mode != "LAND"
+                and self._poll_call() != "pending"
+                and self._now() - self._last_cmd_t >= self.retry_period):
+            self.get_logger().warn("not in LAND yet; re-sending the mode.")
+            self._set_mode("LAND")
+            return
+
+        # Landed = the FCU disarmed us, or the reported altitude has STOPPED
+        # CHANGING.
+        #
+        # It used to be "z <= 0.5 m", an absolute height above the takeoff
+        # plane, and that is what made the vehicle bail out of LAND just before
+        # touchdown: descending through 0.5 m satisfied it, land_settle_s later
+        # the mission called it landed and moved on to DWELL and TAKEOFF while
+        # the vehicle was still in the air — and ArduPilot then rejected the
+        # takeoff because it had never landed. The threshold was also wrong for
+        # the competition outright: it is measured from the takeoff plane, so a
+        # pad higher than the one we left never reaches 0.5 m at all.
+        #
+        # Stillness has neither problem. It is relative, so it does not care
+        # what height the pad is at, and it cannot be satisfied on the way down:
+        # a descending vehicle moves far more than land_still_tol_m across the
+        # window, a resting one moves only estimator noise.
+        # In a DRY RUN the vehicle is disarmed for the whole run by
+        # construction, so this signal is permanently true and would declare
+        # touchdown the instant LAND was entered — at hover height, writing that
+        # height into the pad. Ignore it there and let stillness-plus-descent
+        # decide, which is what the person setting the drone down produces.
+        disarmed = (not self.dry_run) and (not self.mav_state.armed)
+        still = self._z_is_still()
+        descended = (self._land_entry_z is not None
+                     and self.pose is not None
+                     and (self._land_entry_z - self.pose.pose.position.z)
+                     >= self.min_descent)
+
+        # No extra debounce: _z_is_still already demands a FULL land_settle_s
+        # window of stillness before it returns true, and a disarm is definitive.
+        if disarmed or (still and descended):
+            z = self.pose.pose.position.z if self.pose else 0.0
+            why = "disarmed" if disarmed else "descended and stopped"
+            if self.landing_for == self.LAND_PAD:
+                self.landed_count += 1
+                self.get_logger().info(
+                    f"LANDED on base #{self.landed_count} of "
+                    f"{self.target_bases} — resting at z={z:.2f} m ({why}).")
+                self._mark_visited(z)
+            else:
+                self.get_logger().info(
+                    f"LANDED ({self.landing_for}) at z={z:.2f} m ({why}).")
+            self._enter(self.DWELL)
+            return
+
+        if self._since_entered() > self.land_timeout:
+            self.get_logger().warn(
+                f"no touchdown within {self.land_timeout:.0f} s — carrying on "
+                "anyway so the mission does not stall here.")
+            self._enter(self.DWELL)
+
+    def _z_is_still(self) -> bool:
+        """Has the reported altitude stopped moving?
+
+        Peak-to-peak z over the last `land_settle_s`, compared against
+        `land_still_tol_m`. Returns False until the window is actually full, so
+        entering LAND cannot read as "already stopped".
+        """
+        if self.pose is None:
+            return False
+        now = self._now()
+        self._z_hist.append((now, self.pose.pose.position.z))
+
+        # Drop what has aged out, but KEEP the first sample at or before the
+        # cutoff — trimming to exactly the window would leave a span of
+        # land_settle minus one sample period, which never reaches the length
+        # the check below asks for.
+        cutoff = now - self.land_settle
+        while len(self._z_hist) > 1 and self._z_hist[1][0] <= cutoff:
+            self._z_hist.pop(0)
+
+        if now - self._z_hist[0][0] < self.land_settle:
+            # Not a full window yet: entering LAND must not read as stopped.
+            return False
+        zs = [z for _, z in self._z_hist]
+        return (max(zs) - min(zs)) <= self.land_still_tol
+
+    def _mark_visited(self, height: float):
+        """Tell the pad map we landed, so it stops offering this pad."""
+        pad_id = self.target_id if self.target_id is not None \
+            else self._pad_id_below()
+        if pad_id is None:
+            self.get_logger().warn(
+                "landed, but no pad in /hydrone/pads/map is near enough to mark "
+                "visited — the map will not know about this landing.")
+            return
+        if not self.cli_visited.service_is_ready():
+            self.get_logger().warn(
+                "/hydrone/pads/mark_visited unavailable — the map will not know "
+                "about this landing.")
+            return
+        req = MarkPadVisited.Request()
+        req.id = int(pad_id)
+        req.height_valid = True
+        # The altitude we came to rest at IS the pad's top surface.
+        req.height = float(height)
+        self.cli_visited.call_async(req)
+        self.get_logger().info(f"pad {pad_id} marked visited.")
+
+    def _pad_id_below(self) -> int | None:
+        if self.pad_map is None or self.pose is None:
+            return None
+        best, best_d = None, 2.0     # nothing further than 2 m is "under us"
+        for pad in self.pad_map.pads:
+            d = math.hypot(self.pose.pose.position.x - pad.position.x,
+                           self.pose.pose.position.y - pad.position.y)
+            if d < best_d:
+                best, best_d = pad.id, d
+        return best
+
+    # ── DWELL ────────────────────────────────────────────────────────────────
+
+    def _do_dwell(self):
+        """Sit on the pad, then decide whether there is more flying to do."""
+        if self._since_entered() < self.dwell_s:
+            return
+
+        if self.landing_for == self.LAND_FINAL:
+            self.get_logger().info(
+                f"mission complete — {self.landed_count} base(s) landed on, "
+                "home on the takeoff base.")
+            self._enter(self.DONE)
+            return
+
+        if self.landing_for == self.LAND_FALLBACK:
+            # The agreed fallback: touch down, take off once, land again where
+            # we are, stop. No leg home — the whole reason we are here is that
+            # the position estimate has stopped being worth flying on, and a
+            # cross-arena leg is the last thing to attempt on it.
+            self.get_logger().info(
+                "fallback: taking off once more, then landing in place to end "
+                "the run.")
+            self.landing_for = self.LAND_FINAL
+            self._land_after_takeoff = True
+            self._takeoff_tries = 0
+            self._enter(self.ARMING)
+            return
+
+        self._takeoff_tries = 0
+        self.target_id = None
+        self.get_logger().info(
+            f"taking off again — {self.landed_count}/{self.target_bases} "
+            "base(s) done.")
+        self._enter(self.ARMING)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Helpers
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str):
+        if self.cli_mode is None:      # dry run
+            self.get_logger().info(f"[dry] would set mode {mode}.")
+            return
+        req = SetMode.Request()
+        req.custom_mode = mode
+        self._start_call("mode", self.cli_mode, req)
+
+    def _start_call(self, tag: str, client, request):
+        # The last gate. In dry run the FCU clients are None, so a call site
+        # that forgot its own guard lands here and is refused rather than
+        # reaching MAVROS.
+        if client is None:
+            self.get_logger().warn(
+                f"[dry] refused to send '{tag}' — no client exists in dry run.")
+            return
+        if not client.service_is_ready():
+            self._throttle(f"service {client.srv_name} not up yet")
+            return
+        self._pending = tag
+        self._last_cmd_t = self._now()
+        self._call = _Call(self, client, request, self.svc_timeout)
+
+    def _poll_call(self) -> str:
+        """Advance the in-flight call. Returns its status, 'idle' if none."""
+        if self._call is None:
+            return "idle"
+        status = self._call.poll(self.get_clock().now().nanoseconds)
+        if status == _Call.PENDING:
+            return "pending"
+        if status != _Call.OK:
+            self.get_logger().warn(
+                f"{self._call.name} ({self._pending}) -> {status}"
+                + (f": {self._fcu_reason()}" if self._pending in ("arm", "takeoff")
+                   else ""))
+        self._call = None
+        return status
+
+    def _enter(self, state: str):
+        if state != self.state:
+            self.get_logger().info(f"[{self.state} -> {state}]")
+        if state == self.TAKEOFF:
+            # The altitude this climb starts from. takeoff_alt is a height ABOVE
+            # WHATEVER WE ARE STANDING ON, and pose.z is absolute in the FCU's
+            # local frame (zeroed at the FIRST takeoff plane), so the two are
+            # only comparable on the first climb of a run. See _do_takeoff.
+            self._takeoff_start_z = (self.pose.pose.position.z
+                                     if self.pose is not None else 0.0)
+        self.state = state
+        self._state_since = self._now()
+        self._call = None
+        self._pending = None
+        # Let the new state issue its first command immediately rather than
+        # waiting out the retry period of whatever the old state was doing.
+        self._last_cmd_t = 0.0
+
+    def _since_entered(self) -> float:
+        return self._now() - self._state_since
+
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _throttle(self, text: str):
+        self.get_logger().info(text, throttle_duration_sec=5.0)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Dry run: talking to the person holding the drone
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _pilot_cue(self):
+        """Once a second, say what the mission wants the human to do NOW.
+
+        Derived entirely from the live state, setpoint and pose rather than
+        emitted once at each transition: the person has both hands on a drone
+        and is not watching the moment a line scrolls past, and a cue that is
+        recomputed cannot drift from what the state machine is actually waiting
+        for. Every number in here is measured — the same numbers the transition
+        is testing — so when a cue stops changing, that IS the mission being
+        stuck, not the reporting.
+        """
+        pose = self.pose
+        cue = None
+
+        if self.state == self.WAIT_FCU:
+            if not self.mav_state.connected:
+                cue = "waiting for the MAVROS link to the FCU."
+            elif pose is None:
+                cue = ("waiting for /mavros/local_position/pose. No position "
+                       "estimate yet — the EKF needs vision; check that "
+                       "/mavros/vision_pose/pose is being published.")
+            else:
+                cue = "ready."
+        elif self.state == self.ARMING:
+            left = max(0.0, self.dry_arm_delay - self._since_entered())
+            cue = (f"HOLD STILL on the base — treating the vehicle as armed in "
+                   f"{left:.0f} s. Nothing will be sent to the FCU.")
+        elif self.state == self.REGISTER:
+            cue = "HOLD STILL — registering this spot as the takeoff base."
+        elif self.state == self.TAKEOFF and pose is not None:
+            climbed = pose.pose.position.z - self._takeoff_start_z
+            cue = (f"RAISE the drone to {self.takeoff_alt:.2f} m above what it "
+                   f"is standing on — {climbed:.2f} m of "
+                   f"{self.takeoff_alt:.2f} m so far.")
+        elif self.state == self.SETTLE:
+            left = max(0.0, self.settle_s - self._since_entered())
+            cue = (f"HOLD STILL where you are for {left:.0f} s — the map is not "
+                   "read while anything is moving.")
+        elif self.state == self.ROTATE and pose is not None:
+            err = wrap_pi(self.setpoint[3] - yaw_of(pose))
+            way = "LEFT (anticlockwise)" if err > 0 else "RIGHT (clockwise)"
+            cue = (f"TURN the drone {way} {abs(math.degrees(err)):.0f} deg, on "
+                   f"the spot — to heading "
+                   f"{math.degrees(self.setpoint[3]):.0f} deg.")
+        elif self.state == self.TRAVEL and pose is not None:
+            dx = self.setpoint[0] - pose.pose.position.x
+            dy = self.setpoint[1] - pose.pose.position.y
+            d = math.hypot(dx, dy)
+            if d <= self.arrive_tol:
+                cue = "HOLD — you are over the target."
+            else:
+                # A compass-style bearing relative to the nose, because the
+                # person is behind the drone and cannot read an ENU heading.
+                rel = math.degrees(wrap_pi(math.atan2(dy, dx) - yaw_of(pose)))
+                side = "left" if rel > 0 else "right"
+                cue = (f"CARRY the drone {d:.2f} m to "
+                       f"({self.setpoint[0]:.2f}, {self.setpoint[1]:.2f}) — "
+                       f"{abs(rel):.0f} deg to the {side} of where the nose "
+                       f"points. Keep it at {self.setpoint[2]:.2f} m and do "
+                       "not turn it.")
+        elif self.state == self.CONFIRM:
+            left = max(0.0, self.confirm_timeout - self._since_entered())
+            cue = (f"HOLD THE DRONE OVER THE PAD, lens down — "
+                   f"{self._confirm_hits}/{self.confirm_detections} good looks, "
+                   f"{left:.0f} s before this candidate is rejected.")
+        elif self.state == self.LAND:
+            cue = ("PUT THE DRONE DOWN on the pad and let go — touchdown is "
+                   "declared when the altitude stops changing.")
+        elif self.state == self.DWELL:
+            left = max(0.0, self.dwell_s - self._since_entered())
+            cue = f"RESTING on the pad — {left:.0f} s, then pick it up again."
+        elif self.state == self.DONE:
+            cue = "rehearsal complete."
+        elif self.state == self.ABORTED:
+            cue = "rehearsal aborted."
+
+        if cue is not None:
+            self.get_logger().info(f">>> {cue}")
+
+    def _dry_audit(self):
+        """Check, once, that nothing else is driving the vehicle either.
+
+        This node publishes no setpoint in dry run — it has no publisher. But a
+        rehearsal is usually started while something else was already up, and
+        the failure that produces is silent: phase1_real or landing_sites left
+        running in another terminal goes on commanding the vehicle for real
+        while this window prints >>> lines as though the drone were inert.
+        Every launch file in this package warns that two of them fight over
+        /mavros/setpoint_position/local; this is that warning, at the one moment
+        it can be checked rather than remembered.
+
+        Deliberately NOT a check on whether the vehicle can be armed. It cannot
+        be one: MAVROS runs normally here, /mavros/cmd/arming exists, and the
+        transmitter was never going through MAVROS in the first place. Arming
+        is settled at the flight controller — an arming check the vehicle
+        cannot pass — and a green line here would only invite someone to skip
+        setting it.
+        """
+        self._audit_timer.cancel()
+        others = self.count_publishers("/mavros/setpoint_position/local")
+        if others == 0:
+            self.get_logger().info(
+                "[dry] nothing is publishing setpoints — this is the only "
+                "thing talking to the vehicle, and it is talking to you.")
+            return
+        self.get_logger().error(
+            "════════════════════════════════════════════════════════\n"
+            f"  {others} NODE(S) ARE PUBLISHING SETPOINTS.\n"
+            "  It is not this one — in dry run this node has no setpoint\n"
+            "  publisher at all. Something else is commanding the vehicle\n"
+            "  for real: most likely phase1_real.launch.py or\n"
+            "  landing_sites.launch.py still running in another terminal.\n"
+            "  Stop it before you pick the drone up. The >>> lines below\n"
+            "  are NOT the only thing the vehicle is being told.\n"
+            "════════════════════════════════════════════════════════")
+
+    def _publish_status(self):
+        x = self.pose.pose.position.x if self.pose else float("nan")
+        y = self.pose.pose.position.y if self.pose else float("nan")
+        z = self.pose.pose.position.z if self.pose else float("nan")
+        yaw = math.degrees(yaw_of(self.pose)) if self.pose else float("nan")
+        self.pub_status.publish(String(data=(
+            ("DRY " if self.dry_run else "")
+            + f"state={self.state} mode={self.mav_state.mode} "
+            f"armed={self.mav_state.armed} "
+            f"x={x:.2f} y={y:.2f} z={z:.2f} yaw={yaw:.0f} "
+            f"landed={self.landed_count}/{self.target_bases} "
+            f"turns={self.rotations_done}/{self.max_rotations} "
+            f"target={self.target_id} blacklisted={sorted(self.blacklist)}")))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = Phase1MissionNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

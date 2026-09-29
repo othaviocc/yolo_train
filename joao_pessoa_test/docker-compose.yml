@@ -1,0 +1,62 @@
+services:
+  hydrone:
+    build: .
+    # Host networking: DDS discovery, SITL JSON-model UDP and MAVLink all use
+    # localhost ports. Host IPC: BiguaSim talks to UE5 over shared memory.
+    network_mode: host
+    ipc: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      # Private DDS domain so other ROS 2 apps on this host (default domain 0)
+      # can't reach the micro-ROS agent. Match this on the host via env.sh.
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-42}
+      # - ROS_LOCALHOST_ONLY=1
+      # Asset backend used by `biguasim.install(...)`; set on the host if used.
+      - BS_WORLDS_URL=${BS_WORLDS_URL:-}
+      # Empty (the default) runs the simulator inside this container, as ever.
+      # Set, it runs SITL and the autonomy stack against a world process
+      # elsewhere -- sources_sim.launch.py reads these and swaps ardubridge_node
+      # for remote_ardubridge_node. scripts/docker_up.sh --world sets them.
+      - WORLD_ADDRESS=${WORLD_ADDRESS:-}
+      - WORLD_PORT=${WORLD_PORT:-8770}
+    volumes:
+      # UE5 viewport on the host X server (run `xhost +local:docker` first,
+      # or use scripts/docker_up.sh)
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Simulator repo (provides the `biguasim` Python package, installed at
+      # container start). Override BS_SIM_DIR if yours lives elsewhere.
+      - ${BS_SIM_DIR:-../bs-competition/bs-drone-competition}:/opt/bs-drone-competition:ro
+      # Reuse the worlds/packages already downloaded on the host (the
+      # entrypoint drops to the unprivileged 'hydrone' user, uid 1000)
+      - ${HOME}/.local/share/biguasim:/home/hydrone/.local/share/biguasim
+      # Phase 4 persistent maps (lio_map_node), kept across container runs
+      - ./maps:/ws/maps
+    devices:
+      # GPU access for the UE5 binary (Intel/AMD via mesa). For NVIDIA install
+      # nvidia-container-toolkit and add:  gpus: all
+      - /dev/dri:/dev/dri
+    # HYDRONE_LAUNCH picks what runs. Default is the bare sim bring-up (sensors
+    # + SITL + MAVROS, no autonomy) so `docker_up.sh` still gives a vehicle you
+    # fly yourself from QGC. `docker_up.sh --phase1` sets it to
+    # phase1_sim.launch.py (docs/Phase 1 Mission.md) and `--landing-sites` to
+    # landing_sites_sim.launch.py (docs/Landing Sites.md); both add the pad
+    # detectors, the maps and a mission on top.
+    #
+    # HYDRONE_LAUNCH_ARGS is whatever `name:=value` pairs were passed to
+    # docker_up.sh, joined with spaces, and is normally empty. It is
+    # deliberately UNQUOTED below: compose interpolates it into this string and
+    # then splits shell-style, which is how several pairs become several
+    # arguments — and how an empty value adds nothing at all.
+    #
+    # HYDRONE_ODOM_ARGS carries the two arguments only the Holybro launches
+    # declare: odom_error_print (which defaults ON here, unlike the launch
+    # file's own default — the sim is where you want to see VO drift; flipped
+    # by docker_up.sh --no-odom-print) and odom_source (what the EKF navigates
+    # on; docker_up.sh --ground-truth sets ground_truth, a debugging aid only —
+    # see sources_sim.launch.py).
+    #
+    # Written with `-` and not `:-`, so an UNSET variable takes the default
+    # pair and an EMPTY one takes nothing: docker_up.sh empties it for
+    # --phase4, whose aircraft has one sensor and no estimator to choose
+    # between, while a plain `docker compose up` still gets the defaults.
+    command: ros2 launch hydrone_bringup ${HYDRONE_LAUNCH:-hydrone_sim.launch.py} ${HYDRONE_ODOM_ARGS-odom_error_print:=true odom_source:=vo} ${HYDRONE_LAUNCH_ARGS:-}

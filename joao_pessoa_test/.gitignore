@@ -1,0 +1,59 @@
+# ─── Colcon / ROS 2 build outputs ────────────────────────────────
+build/
+install/
+log/
+
+# ─── Imported source dependencies (pinned in deps.repos) ─────────
+src/ardupilot/
+src/micro_ros_agent/
+src/micro_ros_msgs/
+tools/Micro-XRCE-DDS-Gen/
+
+# ─── SITL / MAVProxy runtime artifacts ───────────────────────────
+logs/
+terrain/
+eeprom.bin
+*.tlog
+*.tlog.raw
+*.BIN
+LASTLOG.TXT
+dumpcore.sh_*.out
+dumpstack.sh_*.out
+frames_*.gv
+mav.parm
+
+# ─── VO drift logs (odom_error_node) ─────────────────────────────
+odom_error_*.csv
+
+# ─── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ─── Editors / misc ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ─── Obsidian (docs/ vault) ───────────────────────────────────────
+.obsidian/workspace.json
+
+# ─── Jetson image build inputs ───────────────────────────────────
+# The ZED SDK installer (84 MB) is NOT committed: it is re-downloadable from
+# stereolabs.com and too big for git. See docs/Jetson Real Stack.md §3.
+docker/ZED_SDK_*.run
+# The pyzed wheel IS committed (3.7 MB). It is the one build input that is NOT
+# reproducible from a URL — a from-source Cython build against SDK 4.0.8 and
+# numpy 1.21, and rebuilding it means re-walking the tag hunt and the two
+# setup.py/libusb patches in scripts/build_pyzed.sh. Losing it costs an hour;
+# storing it costs 3.7 MB.
+!docker/pyzed-*.whl
+
+# ─── Phase 4 saved maps (lio_map_node) ───────────────────────────
+maps/
+
+CLAUDE.md
+
+graphify-out/

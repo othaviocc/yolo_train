@@ -1,0 +1,27 @@
+# NVIDIA dGPU override — requires nvidia-container-toolkit on the host:
+#
+#   sudo apt install nvidia-container-toolkit
+#   sudo nvidia-ctk runtime configure --runtime=docker
+#   sudo systemctl restart docker
+#
+# scripts/docker_up.sh detects the runtime and adds this file automatically;
+# manual use:  docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up
+services:
+  hydrone:
+    # CDI mode (not `gpus: all`): the legacy injection path delivers only the
+    # compute stack, while the CDI spec also mounts the Vulkan ICD + GL
+    # libraries UE5 needs. UE5 then picks the discrete GPU on hybrid laptops.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
+    environment:
+      # PRIME render offload: UE5 otherwise enumerates the iGPU first on
+      # hybrid laptops; the NV_optimus Vulkan layer filters it out.
+      - __NV_PRIME_RENDER_OFFLOAD=1
+      - __VK_LAYER_NV_optimus=NVIDIA_only
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia

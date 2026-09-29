@@ -1,0 +1,10 @@
+# Whitelist: only what the image build needs goes into the context.
+*
+!deps.repos
+!docker/
+!src/
+# vcs-imported sources are cloned inside the image, not copied
+src/ardupilot/
+src/micro_ros_agent/
+src/micro_ros_msgs/
+**/__pycache__
