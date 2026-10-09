@@ -1,0 +1,6 @@
+path: /home/lh/Documents/kit_dataset_sim
+train: images/train
+val: images/val
+
+nc: 1
+names: ['lipo']
