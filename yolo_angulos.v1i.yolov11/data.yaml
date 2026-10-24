@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['direita', 'esquerda', 'horizontal', 'vertical']
+
+roboflow:
+  workspace: teste-nafen
+  project: yolo_angulos
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/teste-nafen/yolo_angulos/dataset/1
